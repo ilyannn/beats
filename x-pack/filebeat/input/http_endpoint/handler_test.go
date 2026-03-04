@@ -26,6 +26,7 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
+	"github.com/elastic/beats/v7/libbeat/management/status"
 	"github.com/elastic/beats/v7/testing/testutils"
 	"github.com/elastic/elastic-agent-libs/logp"
 	"github.com/elastic/elastic-agent-libs/mapstr"
@@ -890,4 +891,156 @@ func TestConcurrentRequestsExceedHighWater(t *testing.T) {
 	assert.Equal(t, http.StatusOK, slowReqStatus)
 	// The fast request should be rejected with 503 (in-flight was above high water).
 	assert.Equal(t, http.StatusServiceUnavailable, fastReqStatus)
+}
+
+// recordingReporter records status updates for testing.
+type recordingReporter struct {
+	mu      sync.Mutex
+	updates []statusUpdate
+}
+
+type statusUpdate struct {
+	status status.Status
+	msg    string
+}
+
+func (r *recordingReporter) UpdateStatus(s status.Status, msg string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.updates = append(r.updates, statusUpdate{status: s, msg: msg})
+}
+
+func (r *recordingReporter) last() (statusUpdate, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.updates) == 0 {
+		return statusUpdate{}, false
+	}
+	return r.updates[len(r.updates)-1], true
+}
+
+func TestHandlerStatusUpdates(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("client_error_wrong_method_no_degraded", func(t *testing.T) {
+		c := defaultConfig()
+		reporter := &recordingReporter{}
+		pub := new(publisher)
+		metrics := newInputMetrics(monitoring.NewRegistry(), logp.NewNopLogger())
+		h := newHandler(ctx, c, nil, pub.Publish, reporter, logp.NewLogger("test"), metrics)
+
+		// Send GET instead of POST (default method is POST).
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("Content-Type", "application/json")
+		respRec := httptest.NewRecorder()
+		h.ServeHTTP(respRec, req)
+
+		assert.Equal(t, http.StatusMethodNotAllowed, respRec.Code)
+		// Client validation error should NOT set Degraded.
+		_, ok := reporter.last()
+		assert.False(t, ok, "no status update expected for client validation error")
+	})
+
+	t.Run("client_error_bad_json_no_degraded", func(t *testing.T) {
+		c := defaultConfig()
+		reporter := &recordingReporter{}
+		pub := new(publisher)
+		metrics := newInputMetrics(monitoring.NewRegistry(), logp.NewNopLogger())
+		h := newHandler(ctx, c, nil, pub.Publish, reporter, logp.NewLogger("test"), metrics)
+
+		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`not json`))
+		req.Header.Set("Content-Type", "application/json")
+		respRec := httptest.NewRecorder()
+		h.ServeHTTP(respRec, req)
+
+		assert.Equal(t, http.StatusBadRequest, respRec.Code)
+		// Malformed JSON is a client error; should NOT set Degraded.
+		_, ok := reporter.last()
+		assert.False(t, ok, "no status update expected for malformed JSON")
+	})
+
+	t.Run("server_error_backpressure_sets_degraded", func(t *testing.T) {
+		c := defaultConfig()
+		c.MaxInFlight = 10000
+		c.HighWaterInFlight = 100
+		c.LowWaterInFlight = 50
+		reporter := &recordingReporter{}
+		pub := new(publisher)
+		metrics := newInputMetrics(monitoring.NewRegistry(), logp.NewNopLogger())
+		h := newHandler(ctx, c, nil, pub.Publish, reporter, logp.NewLogger("test"), metrics).(*handler)
+
+		// Simulate in-flight bytes above high water and set reject mode.
+		h.inFlight.Store(150)
+		h.accepting.Store(false)
+
+		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"id":1}`))
+		req.Header.Set("Content-Type", "application/json")
+		respRec := httptest.NewRecorder()
+		h.ServeHTTP(respRec, req)
+
+		assert.Equal(t, http.StatusServiceUnavailable, respRec.Code)
+		// Backpressure is a server-side issue; SHOULD set Degraded.
+		last, ok := reporter.last()
+		require.True(t, ok, "expected a status update for backpressure")
+		assert.Equal(t, status.Degraded, last.status)
+	})
+
+	t.Run("successful_request_sets_running", func(t *testing.T) {
+		c := defaultConfig()
+		reporter := &recordingReporter{}
+		pub := new(publisher)
+		metrics := newInputMetrics(monitoring.NewRegistry(), logp.NewNopLogger())
+		h := newHandler(ctx, c, nil, pub.Publish, reporter, logp.NewLogger("test"), metrics)
+
+		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"id":1}`))
+		req.Header.Set("Content-Type", "application/json")
+		respRec := httptest.NewRecorder()
+		h.ServeHTTP(respRec, req)
+
+		assert.Equal(t, http.StatusOK, respRec.Code)
+		// Successful request should set Running.
+		last, ok := reporter.last()
+		require.True(t, ok, "expected a status update for successful request")
+		assert.Equal(t, status.Running, last.status)
+	})
+
+	t.Run("successful_request_after_degraded_sets_running", func(t *testing.T) {
+		c := defaultConfig()
+		c.MaxInFlight = 10000
+		c.HighWaterInFlight = 100
+		c.LowWaterInFlight = 50
+		reporter := &recordingReporter{}
+		pub := new(publisher)
+		metrics := newInputMetrics(monitoring.NewRegistry(), logp.NewNopLogger())
+		h := newHandler(ctx, c, nil, pub.Publish, reporter, logp.NewLogger("test"), metrics).(*handler)
+
+		// First: trigger backpressure to set Degraded.
+		h.inFlight.Store(150)
+		h.accepting.Store(false)
+
+		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"id":1}`))
+		req.Header.Set("Content-Type", "application/json")
+		respRec := httptest.NewRecorder()
+		h.ServeHTTP(respRec, req)
+		assert.Equal(t, http.StatusServiceUnavailable, respRec.Code)
+
+		last, ok := reporter.last()
+		require.True(t, ok)
+		assert.Equal(t, status.Degraded, last.status)
+
+		// Second: clear backpressure and send a valid request.
+		h.inFlight.Store(0)
+		h.accepting.Store(true)
+
+		req = httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"id":2}`))
+		req.Header.Set("Content-Type", "application/json")
+		respRec = httptest.NewRecorder()
+		h.ServeHTTP(respRec, req)
+		assert.Equal(t, http.StatusOK, respRec.Code)
+
+		// Should now be Running again.
+		last, ok = reporter.last()
+		require.True(t, ok)
+		assert.Equal(t, status.Running, last.status)
+	})
 }

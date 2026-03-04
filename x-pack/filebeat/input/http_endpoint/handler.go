@@ -99,7 +99,6 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.log.Debugw("request", "url", r.URL, "method", r.Method, "tx_id", txID)
 	code, err := h.validator.validateRequest(r)
 	if err != nil {
-		h.status.UpdateStatus(status.Degraded, "request did not validate: "+err.Error())
 		h.sendAPIErrorResponse(txID, w, r, h.log, code, err)
 		return
 	}
@@ -114,7 +113,6 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	wait, err := getTimeoutWait(r.URL, h.log)
 	if err != nil {
-		h.status.UpdateStatus(status.Degraded, "invalid wait_for_completion_timeout request: "+err.Error())
 		h.sendAPIErrorResponse(txID, w, r, h.log, http.StatusBadRequest, err)
 		return
 	}
@@ -169,7 +167,6 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.metrics.contentLength.Update(r.ContentLength)
 	body, code, err := getBodyReader(r)
 	if err != nil {
-		h.status.UpdateStatus(status.Degraded, "unable to get body reader: "+err.Error())
 		h.sendAPIErrorResponse(txID, w, r, h.log, code, err)
 		h.metrics.apiErrors.Add(1)
 		return
@@ -219,7 +216,6 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.sendAPIErrorResponse(txID, w, r, h.log, code, err)
-		h.status.UpdateStatus(status.Degraded, "unable to read message JSON: "+err.Error())
 		h.metrics.apiErrors.Add(1)
 		return
 	}
@@ -244,7 +240,6 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				break
 			} else if !errors.Is(err, errNotCRC) {
 				h.metrics.apiErrors.Add(1)
-				h.status.UpdateStatus(status.Degraded, "request did not validate with CRC: "+err.Error())
 				h.sendAPIErrorResponse(txID, w, r, h.log, http.StatusBadRequest, err)
 				return
 			}
